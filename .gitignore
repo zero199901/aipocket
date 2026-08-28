@@ -59,6 +59,7 @@ frontend/coverage/
 *.sqlite
 *.sqlite3
 state/
+data/
 
 # Tooling
 .codegraph
