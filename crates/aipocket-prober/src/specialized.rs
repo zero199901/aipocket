@@ -162,7 +162,10 @@ pub async fn validate_specialized(
             .unwrap_or_default()
             .into(),
         models,
-        error: if status.as_u16() == 401 || status.as_u16() == 403 {
+        error: if status.as_u16() == 401
+            || status.as_u16() == 403
+            || crate::validator::is_definitive_key_rejection(status.as_u16(), &body)
+        {
             "unauthorized".into()
         } else if !status.is_success() {
             "read-failed".into()

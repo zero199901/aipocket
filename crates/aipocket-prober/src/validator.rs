@@ -61,7 +61,10 @@ impl Validator {
             result.provider_info.models_available = specialized.models;
             result.validation_state = if result.valid {
                 "final_verified".into()
-            } else if matches!(result.status_code, Some(401 | 403)) {
+            } else if is_definitive_key_rejection(
+                result.status_code.unwrap_or_default(),
+                &result.provider_evidence,
+            ) {
                 "rejected".into()
             } else {
                 "transient".into()
@@ -119,20 +122,76 @@ impl Validator {
         let body: Value = response.json().await.unwrap_or(json!({}));
         let models = extract_models(&body);
         result.valid = status.is_success() && !models.is_empty();
+        let definitive = is_definitive_key_rejection(status.as_u16(), &body);
         result.validation_state = if result.valid {
             "final_verified".into()
-        } else if status.as_u16() == 401 || status.as_u16() == 403 || status.is_success() {
+        } else if status.is_success() || definitive {
             "rejected".into()
         } else {
             "transient".into()
         };
         if status.is_success() && models.is_empty() {
             result.error = "invalid-response-schema".into();
+        } else if definitive && result.error.is_empty() {
+            result.error = "unauthorized".into();
         }
         result.response_snippet = body.to_string().chars().take(512).collect();
         result.provider_info.models_available = models;
         Ok(result)
     }
+}
+/// True when the provider's response itself declares the credential invalid —
+/// a definitive rejection regardless of HTTP status (e.g. Google answers 400
+/// with `API_KEY_INVALID` for revoked keys, so "only 401/403 reject" would
+/// misfile every dead gemini key as retryable).
+pub(crate) fn is_definitive_key_rejection(status: u16, body: &Value) -> bool {
+    status == 401 || status == 403 || definitive_key_error_signature(body)
+}
+fn definitive_key_error_signature(body: &Value) -> bool {
+    const CODE_TOKENS: [&str; 4] = [
+        "invalid_api_key",
+        "api_key_invalid",
+        "api_key_expired",
+        "api_key_unauthorized",
+    ];
+    const MESSAGE_TOKENS: [&str; 5] = [
+        "invalid",
+        "not valid",
+        "expired",
+        "incorrect",
+        "unauthorized",
+    ];
+    let empty = Vec::new();
+    let mut tokens = Vec::new();
+    let mut messages = Vec::new();
+    let top = body;
+    let error = body.get("error").unwrap_or(&Value::Null);
+    for node in [top, error] {
+        for key in ["code", "type", "status", "reason"] {
+            if let Some(value) = node.get(key).and_then(Value::as_str) {
+                tokens.push(value.to_ascii_lowercase());
+            }
+        }
+        if let Some(value) = node.get("message").and_then(Value::as_str) {
+            messages.push(value.to_ascii_lowercase());
+        }
+        for detail in node
+            .get("details")
+            .and_then(Value::as_array)
+            .unwrap_or(&empty)
+        {
+            if let Some(reason) = detail.get("reason").and_then(Value::as_str) {
+                tokens.push(reason.to_ascii_lowercase());
+            }
+        }
+    }
+    tokens
+        .iter()
+        .any(|token| CODE_TOKENS.iter().any(|code| token.contains(code)))
+        || messages.iter().any(|message| {
+            message.contains("api key")
+                && MESSAGE_TOKENS.iter().any(|token| message.contains(token))
+        })
 }
 fn extract_models(value: &Value) -> Vec<String> {
     value
@@ -203,6 +262,40 @@ mod tests {
                 }),
             )
             .route(
+                "/invalid/v1beta/models",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "code": 400,
+                                "message": "API key not valid. Please pass a valid API key.",
+                                "status": "INVALID_ARGUMENT",
+                                "details": [
+                                    {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                     "reason": "API_KEY_INVALID", "domain": "googleapis.com"}
+                                ]
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
+                "/invalidkey/v1/models",
+                get(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "Incorrect API key provided: sk-dead. You can find your API key at https://example.com.",
+                                "type": "invalid_request_error",
+                                "code": "invalid_api_key"
+                            }
+                        })),
+                    )
+                }),
+            )
+            .route(
                 "/html/v1/models",
                 get(|| async { (StatusCode::OK, "<!doctype html><title>not an API</title>") }),
             )
@@ -233,6 +326,34 @@ mod tests {
             vec!["c"]
         );
         assert!(extract_models(&json!({"data":[{"unknown":"d"}]})).is_empty());
+    }
+
+    #[test]
+    fn definitive_rejection_needs_status_or_body_evidence() {
+        let google = json!({
+            "error": {
+                "code": 400, "status": "INVALID_ARGUMENT",
+                "message": "API key not valid. Please pass a valid API key.",
+                "details": [{"reason": "API_KEY_INVALID"}]
+            }
+        });
+        let openai = json!({
+            "error": {"code": "invalid_api_key", "message": "Incorrect API key provided."}
+        });
+        let plain = json!({"error": "busy"});
+        let expired_only = json!({
+            "error": {"details": [{"reason": "API_KEY_EXPIRED"}]}
+        });
+        // Body evidence rejects regardless of status…
+        assert!(is_definitive_key_rejection(400, &google));
+        assert!(is_definitive_key_rejection(400, &openai));
+        assert!(is_definitive_key_rejection(429, &expired_only));
+        assert!(is_definitive_key_rejection(401, &plain));
+        assert!(is_definitive_key_rejection(403, &plain));
+        // …while non-auth failures without evidence stay transient.
+        assert!(!is_definitive_key_rejection(400, &plain));
+        // A 200 empty-models response is schema-invalid, not key evidence.
+        assert!(!definitive_key_error_signature(&json!({"data": []})));
     }
 
     #[tokio::test]
@@ -305,6 +426,37 @@ mod tests {
         assert!(!transient.valid);
         assert_eq!(transient.status_code, Some(503));
         assert_eq!(transient.validation_state, "transient");
+
+        // Gemini answers 400 (not 401/403) for dead keys; the body signature
+        // must still classify it as rejected.
+        let gemini_invalid = validator
+            .validate(credential(
+                "AI-invalid-gemini-key",
+                format!(
+                    "http://generativelanguage.googleapis.com:{}/invalid",
+                    address.port()
+                ),
+            ))
+            .await
+            .unwrap();
+        assert!(!gemini_invalid.valid);
+        assert_eq!(gemini_invalid.status_code, Some(400));
+        assert_eq!(gemini_invalid.validation_state, "rejected");
+        assert_eq!(gemini_invalid.error, "unauthorized");
+
+        // Same guard for the generic /v1/models lane shared by the ~20
+        // non-specialized providers.
+        let generic_invalid = validator
+            .validate(credential(
+                "sk-generic-abcdefghijkl",
+                format!("{base}/invalidkey"),
+            ))
+            .await
+            .unwrap();
+        assert!(!generic_invalid.valid);
+        assert_eq!(generic_invalid.status_code, Some(400));
+        assert_eq!(generic_invalid.validation_state, "rejected");
+        assert_eq!(generic_invalid.error, "unauthorized");
         for path in ["html", "empty"] {
             let invalid = validator
                 .validate(credential(
