@@ -175,6 +175,13 @@ fn definitive_key_error_signature(body: &Value) -> bool {
         if let Some(value) = node.get("message").and_then(Value::as_str) {
             messages.push(value.to_ascii_lowercase());
         }
+        // x.ai and FastAPI-style providers put the human text in a bare
+        // string field instead of a message object member.
+        for key in ["error", "detail"] {
+            if let Some(value) = node.get(key).and_then(Value::as_str) {
+                messages.push(value.to_ascii_lowercase());
+            }
+        }
         for detail in node
             .get("details")
             .and_then(Value::as_array)
@@ -340,6 +347,11 @@ mod tests {
         let openai = json!({
             "error": {"code": "invalid_api_key", "message": "Incorrect API key provided."}
         });
+        // x.ai puts the human text in a bare `error` string, not an object.
+        let xai = json!({
+            "code": "invalid-argument",
+            "error": "Incorrect API key provided. You can obtain an API key from https://console.x.ai."
+        });
         let plain = json!({"error": "busy"});
         let expired_only = json!({
             "error": {"details": [{"reason": "API_KEY_EXPIRED"}]}
@@ -347,6 +359,7 @@ mod tests {
         // Body evidence rejects regardless of status…
         assert!(is_definitive_key_rejection(400, &google));
         assert!(is_definitive_key_rejection(400, &openai));
+        assert!(is_definitive_key_rejection(400, &xai));
         assert!(is_definitive_key_rejection(429, &expired_only));
         assert!(is_definitive_key_rejection(401, &plain));
         assert!(is_definitive_key_rejection(403, &plain));
