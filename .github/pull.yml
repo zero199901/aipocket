@@ -1,0 +1,6 @@
+version: '1'
+rules:
+- base: main
+  upstream: james-6-23:main
+  mergeMethod: merge
+  mergeUnstable: false
